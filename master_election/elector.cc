@@ -19,27 +19,6 @@ template<class M, class A, class B>
 std::function<void (A, B)> NewMemberCallback2(M* obj, void (M::* fn)(A, B)) {
   return [obj, fn](A a, B b) -> void { (obj->*fn)(a, b); };
 }
-template<class M, class A, class B, class C>
-std::function<void (A, B)> NewMemberCallback3(M* obj, void (M::* fn)(A, B, C), C c) {
-  return [obj, fn, c](A a, B b) -> void { (obj->*fn)(a, b, c); };
-}
-
-template<class T>
-class CountBarrier {
- public:
-  CountBarrier(uint32_t count, std::function<T> fn) : count_(count), func_(fn) {}
-
-  void Run() {
-    if (--count_ == 0) {
-      func_();
-      delete this;
-    }
-  }
-
- private:
-  std::atomic<uint32_t> count_;
-  std::function<T> func_;
-};
 
 size_t Elector::FindOwnReplica(const std::vector<ElectorStub*>& replicas) {
   for (size_t i = 0; i < replicas.size(); ++i) {
@@ -63,20 +42,24 @@ void Elector::Run() {
         perform_prepare = true;
         new_sequence_nr = ++sequence_nr_;
         master_index_ = -1;
-      } else if (IAmTheMasterLocked() &&
-                 time(NULL) > master_lease_valid_until_ - kMasterLeaseRenewBeforeTimeout) {
-        // I'm the master, but my lease time is near end
-        perform_accept = true;
-        new_sequence_nr = ++sequence_nr_;
+      } else if (IAmTheMasterLocked()) {
+        if (my_proposal_.sequence_nr < sequence_nr_) {
+          // I'm the master, but there was some contender for title, bump up my sequence number
+          perform_prepare = true;
+          new_sequence_nr = ++sequence_nr_;
+        } else if (time(NULL) > master_lease_valid_until_ - kMasterLeaseRenewBeforeTimeout) {
+          // I'm the master, but my lease time is near end
+          perform_accept = true;
+          new_sequence_nr = my_proposal_.sequence_nr;
+        }
       }
     }
     if (perform_prepare) {
       // let's start the election party
-      SendOutPrepareRequests(new_sequence_nr);
+      PerformPreparePhase(new_sequence_nr);
     } else if (perform_accept) {
-      SendOutAcceptRequests(new_sequence_nr);
+      PerformAcceptPhrase(new_sequence_nr);
     }
-    // TODO(kskalski): wait for started actions (at the moment they finish synchronously)
     sleep(1);
   }
 }
@@ -143,11 +126,10 @@ void Elector::HandlePrepareReply(const PrepareResponse& resp, bool success) {
   } else {
     std::cout << "prepare reply fail\n";
   }
-  my_proposal_.barrier->Run();
+  comm_in_progress_.CountDown();
 }
 
-void Elector::HandleAcceptReply(const AcceptResponse& resp, bool success,
-                                CountBarrier<void()>* barrier) {
+void Elector::HandleAcceptReply(const AcceptResponse& resp, bool success) {
   if (success) {
     std::cout << "accept reply, max_seq=" << resp.max_seen_sequence_nr
               << ", ack=" << resp.ack << "\n";
@@ -159,27 +141,28 @@ void Elector::HandleAcceptReply(const AcceptResponse& resp, bool success,
   } else {
     std::cout << "accept reply fail\n";
   }
-  barrier->Run();
+  comm_in_progress_.CountDown();
 }
 
-void Elector::SendOutPrepareRequests(uint32_t sequence_nr) {
-  std::cout << "Starting election with seq nr=" << my_proposal_.sequence_nr << "\n";
-  my_proposal_.barrier = new CountBarrier<void()>(
-      replicas_.size(), std::bind(&Elector::HandleAllPrepareResponses, this));
+void Elector::PerformPreparePhase(uint32_t sequence_nr) {
+  comm_in_progress_ = Latch(replicas_.size() - 1);
   my_proposal_.num_acks = 0;
   my_proposal_.replica_is_master_count.assign(replicas_.size(), 0);
   my_proposal_.replica_is_master_until.assign(replicas_.size(),
                                             std::numeric_limits<uint64_t>::max());
+
   PrepareRequest prepare;
   prepare.sequence_nr = my_proposal_.sequence_nr = sequence_nr;
   prepare.proposer_index = own_index_;
+  std::cout << "Starting election with seq nr=" << my_proposal_.sequence_nr << "\n";
   for (auto* replica : replicas_) {
     if (replica != nullptr) {
       replica->SendPrepareRequest(prepare,
                                   NewMemberCallback2(this, &Elector::HandlePrepareReply));
     }
   }
-  my_proposal_.barrier->Run();
+  comm_in_progress_.Wait();
+  HandleAllPrepareResponses();
 }
 
 void Elector::HandleAllPrepareResponses() {
@@ -202,25 +185,25 @@ void Elector::HandleAllPrepareResponses() {
   }
 
   if (accept_sequence_nr > 0) {
-    SendOutAcceptRequests(accept_sequence_nr);
+    PerformAcceptPhrase(accept_sequence_nr);
   }
 }
 
-void Elector::SendOutAcceptRequests(uint32_t sequence_nr) {
+void Elector::PerformAcceptPhrase(uint32_t sequence_nr) {
   AcceptRequest accept;
   accept.master_index = own_index_;
   num_accept_acks_ = 0;
   accept.sequence_nr = sequence_nr;
 
-  auto* barrier = new CountBarrier<void()>(
-      replicas_.size(), std::bind(&Elector::HandleAllAcceptResponses, this));
+  comm_in_progress_ = Latch(replicas_.size() - 1);
   for (auto* replica : replicas_) {
     if (replica != nullptr) {
       replica->SendAcceptRequest(
-          accept, NewMemberCallback3(this, &Elector::HandleAcceptReply, barrier));
+          accept, NewMemberCallback2(this, &Elector::HandleAcceptReply));
     }
   }
-  barrier->Run();
+  comm_in_progress_.Wait();
+  HandleAllAcceptResponses();
 }
 
 void Elector::HandleAllAcceptResponses() {

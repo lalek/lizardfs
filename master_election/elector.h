@@ -1,6 +1,7 @@
 #ifndef ELECTOR_H_
 #define ELECTOR_H_
 
+#include <condition_variable>
 #include <cstdint>
 #include <vector>
 #include <mutex>
@@ -11,15 +12,39 @@ struct PrepareResponse;
 struct AcceptResponse;
 class ElectorStub;
 
-template<class T> class CountBarrier;
+// TODO(kskalski): Move to separate utilities file
+class Latch {
+ public:
+  Latch(size_t count) : count_(count) {}
+  void operator =(const Latch &other) {
+    count_ = other.count_;
+  }
+
+  void CountDown() {
+    std::lock_guard<std::mutex> l(mu_);
+    if (--count_ == 0) {
+      cond_.notify_one();
+    }
+  }
+
+  void Wait() {
+    std::unique_lock<std::mutex> l(mu_);
+    while (count_ > 0) {
+      cond_.wait(l);
+    }
+  }
+
+ private:
+  size_t count_;
+  std::mutex mu_;
+  std::condition_variable cond_;
+};
 
 struct ProposalState {
   uint32_t sequence_nr;
   uint32_t num_acks;
   std::vector<uint32_t> replica_is_master_count;
   std::vector<uint64_t> replica_is_master_until;
-  // Called by handler of each reply. Calls aggregated reply handler after all replies arrive.
-  CountBarrier<void()>* barrier;
 };
 
 class Elector {
@@ -27,12 +52,13 @@ class Elector {
   Elector(const std::vector<ElectorStub*>& replicas)
       : replicas_(replicas),
         own_index_(FindOwnReplica(replicas)),
+        comm_in_progress_(0),
         sequence_nr_(0),
         master_index_(-1),
         master_lease_valid_until_(0) {
   }
 
-  // Periodically checks if master is elected and performs new election or least re-newal.
+  // Periodically checks if master is elected and performs new election or lease re-newal.
   // Blocks infinitely, should be started in dedicated thread.
   void Run();
 
@@ -49,22 +75,24 @@ class Elector {
 
   // Handlers for async replies from other replicas for Prepare/Accept RPCs sent out earlier.
   void HandlePrepareReply(const PrepareResponse& resp, bool success);
-  void HandleAcceptReply(const AcceptResponse& resp, bool success, CountBarrier<void()>* barrier);
+  void HandleAcceptReply(const AcceptResponse& resp, bool success);
 
   // Broadcast information that this replica wants to start new election with given number.
-  void SendOutPrepareRequests(uint32_t sequence_nr);
+  void PerformPreparePhase(uint32_t sequence_nr);
   void HandleAllPrepareResponses();
 
   // Broadcast information that this replica decided to be master, responses are still checked
   // to confirm that all replicas obey this sovereign act.
-  void SendOutAcceptRequests(uint32_t sequence_nr);
+  void PerformAcceptPhrase(uint32_t sequence_nr);
   void HandleAllAcceptResponses();
 
   // All replicas including this one (replicas_[own_index_] == nullptr).
   const std::vector<ElectorStub*> replicas_;
   const size_t own_index_;
 
-  // We perform at most one proposal or accept broadcast at a time.
+  // We perform at most one proposal or accept broadcast at a time, each reply handler calls
+  // latch to count down. Once all of RPCs are replied control continues to aggregate them.
+  Latch comm_in_progress_;
   ProposalState my_proposal_;
   uint32_t num_accept_acks_;
 
