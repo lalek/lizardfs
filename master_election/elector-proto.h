@@ -14,6 +14,7 @@ struct PrepareRequest {
 struct PrepareResponse {
   uint32_t max_seen_sequence_nr;
   bool ack;
+  int responder_index;
   int master_index;
   uint64_t master_lease_valid_until;
 };
@@ -23,6 +24,8 @@ struct AcceptRequest {
 };
 struct AcceptResponse {
   bool ack;
+  int responder_index;
+  uint64_t master_lease_valid_until;
   uint32_t max_seen_sequence_nr;
 };
 

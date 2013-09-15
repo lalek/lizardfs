@@ -40,11 +40,13 @@ class Latch {
   std::condition_variable cond_;
 };
 
-struct ProposalState {
-  uint32_t sequence_nr;
-  uint32_t num_acks;
-  std::vector<uint32_t> replica_is_master_count;
-  std::vector<uint64_t> replica_is_master_until;
+struct ReplicaInfo {
+  ReplicaInfo()
+    : acked(false), is_master_count(0), is_master_until(std::numeric_limits<uint64_t>::max()) {}
+
+  bool acked;
+  uint32_t is_master_count;
+  uint64_t is_master_until;
 };
 
 class Elector {
@@ -53,6 +55,7 @@ class Elector {
       : replicas_(replicas),
         own_index_(FindOwnReplica(replicas)),
         comm_in_progress_(0),
+        replica_info_(replicas.size()),
         sequence_nr_(0),
         master_index_(-1),
         master_lease_valid_until_(0) {
@@ -78,12 +81,12 @@ class Elector {
   void HandleAcceptReply(const AcceptResponse& resp, bool success);
 
   // Broadcast information that this replica wants to start new election with given number.
-  void PerformPreparePhase(uint32_t sequence_nr);
+  void PerformPreparePhase();
   void HandleAllPrepareResponses();
 
   // Broadcast information that this replica decided to be master, responses are still checked
   // to confirm that all replicas obey this sovereign act.
-  void PerformAcceptPhrase(uint32_t sequence_nr);
+  void PerformAcceptPhrase();
   void HandleAllAcceptResponses();
 
   // All replicas including this one (replicas_[own_index_] == nullptr).
@@ -93,12 +96,13 @@ class Elector {
   // We perform at most one proposal or accept broadcast at a time, each reply handler calls
   // latch to count down. Once all of RPCs are replied control continues to aggregate them.
   Latch comm_in_progress_;
-  ProposalState my_proposal_;
-  uint32_t num_accept_acks_;
+  std::vector<ReplicaInfo> replica_info_;
 
   // Essentially sequence_nr_ reflects promise that this replica won't accept any new master
   // election sequence with lower or equal number.
   uint32_t sequence_nr_;
+  // Sequence number used for our last election proposal, stays the same during our mastership.
+  uint32_t my_proposal_sequence_nr_;
   // Current master: <0 not elected, >=0 index into replicas_
   int master_index_;
   time_t master_lease_valid_until_;
