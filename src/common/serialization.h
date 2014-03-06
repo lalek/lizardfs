@@ -15,6 +15,43 @@ public:
 			Exception("Deserialization error: " + message) {}
 };
 
+template<class T>
+class SerializationModifierBox {
+public:
+	SerializationModifierBox(T& object) : object_(object) {
+	}
+
+	T& get() const {
+		return object_;
+	}
+
+private:
+	T& object_;
+};
+
+template<class T>
+struct FlexiblySerializableVector : public SerializationModifierBox<std::vector<T>&> {
+	FlexiblySerializableVector(std::vector<T>& object)
+			: SerializationModifierBox<std::vector<T>&>(object) {};
+};
+
+template<class T>
+struct ConstFlexiblySerializableVector : public SerializationModifierBox<const std::vector<T>&> {
+	ConstFlexiblySerializableVector(const std::vector<T>& object)
+			: SerializationModifierBox<const std::vector<T>&>(object) {};
+};
+
+template<class T>
+inline FlexiblySerializableVector<T> makeFlexibleSerializationVector(std::vector<T>& vector) {
+	return FlexiblySerializableVector<T>(vector);
+}
+
+template<class T>
+inline ConstFlexiblySerializableVector<T> makeFlexibleSerializationVector(
+		const std::vector<T>& vector) {
+	return ConstFlexiblySerializableVector<T>(vector);
+}
+
 // serializedSize
 
 inline uint32_t serializedSize(const bool&) {
@@ -56,13 +93,19 @@ inline uint32_t serializedSize(const std::string& value) {
 			+ serializedSize(std::string::value_type()) * value.size();
 }
 
-inline uint32_t serializedSize(const std::vector<std::string>& vector) {
+template<class T>
+inline uint32_t serializedSize(const ConstFlexiblySerializableVector<T>& vector) {
 	uint32_t ret = 0;
-	ret += serializedSize(uint32_t(vector.size()));
-	for (const auto& str : vector) {
-		ret += serializedSize(str);
+	ret += serializedSize(uint32_t(vector.get().size()));
+	for (const auto& element : vector.get()) {
+		ret += serializedSize(element);
 	}
 	return ret;
+}
+
+template<class T>
+inline uint32_t serializedSize(const FlexiblySerializableVector<T>& vector) {
+	return ConstFlexiblySerializableVector<T>(vector.get());
 }
 
 template<class T>
@@ -128,10 +171,11 @@ inline void serialize(uint8_t** destination, const std::string& value) {
 	}
 }
 
-inline void serialize(uint8_t** destination, const std::vector<std::string>& vector) {
-	serialize(destination, uint32_t(vector.size()));
-	for (const auto& str : vector) {
-		serialize(destination, str);
+template<class T>
+inline void serialize(uint8_t** destination, const ConstFlexiblySerializableVector<T>& vector) {
+	serialize(destination, uint32_t(vector.get().size()));
+	for (const auto& element : vector.get()) {
+		serialize(destination, element);
 	}
 }
 
@@ -238,14 +282,15 @@ inline void deserialize(const uint8_t** source, uint32_t& bytesLeftInBuffer, std
 	}
 }
 
+template<class T>
 inline void deserialize(const uint8_t** source, uint32_t& bytesLeftInBuffer,
-		std::vector<std::string>& vec) {
-	sassert(vec.size() == 0);
+		FlexiblySerializableVector<T>& vector) {
+	sassert(vector.get().size() == 0);
 	uint32_t size;
 	deserialize(source, bytesLeftInBuffer, size);
-	vec.resize(size);
-	for (unsigned i = 0; i < size; ++i) {
-		deserialize(source, bytesLeftInBuffer, vec[i]);
+	vector.get().resize(size);
+	for (uint32_t i = 0; i < size; ++i) {
+		deserialize(source, bytesLeftInBuffer, vector.get()[i]);
 	}
 }
 
